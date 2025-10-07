@@ -1,6 +1,49 @@
-# Getting Started with Create React App
+# Project Name
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+This project is a web application with a React front-end and a Node.js back-end that uses PostgreSQL for the database.
+
+## Getting Started
+
+These instructions will get you a copy of the project up and running on your local machine for development and testing purposes.
+
+### Prerequisites
+
+- Node.js
+- npm
+- PostgreSQL
+
+### Installing
+
+1.  Clone the repo
+2.  Install NPM packages
+
+    ```sh
+    npm install
+    ```
+
+3.  Set up the PostgreSQL database:
+    -   Create a new PostgreSQL database.
+    -   Update the database connection details in `server.js` with your credentials:
+
+        ```javascript
+        const pool = new Pool({
+          user: 'your_db_user',
+          host: 'localhost',
+          database: 'your_db_name',
+          password: 'your_db_password',
+          port: 5432,
+        });
+        ```
+
+### Running the application
+
+To run both the front-end and back-end servers concurrently, run:
+
+```sh
+npm run dev
+```
+
+This will start the React development server on `http://localhost:3000` and the Node.js server on `http://localhost:3001`.
 
 ## Available Scripts
 
