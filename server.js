@@ -250,6 +250,19 @@ app.post('/login', async (req, res) => {
   }
 });
 
+app.get('/me', authMiddleware, async (req, res) => {
+    try {
+        const r = await pool.query('SELECT id, name, email FROM users WHERE id=$1', [req.user.id]);
+        if (r.rowCount === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        res.json(r.rows[0]);
+    } catch (err) {
+        console.error('me error', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 // Search users by q (email or name)
 app.get('/users/search', authMiddleware, async (req, res) => {
   const q = (req.query.q || '').trim();

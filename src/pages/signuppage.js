@@ -1,7 +1,9 @@
+// src/pages/Signup.jsx
 import React, { useState } from "react";
 import { motion } from "framer-motion";
 import { UserPlus } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+import { setToken, setUser } from "../utils/auth"; // adjust path if needed
 
 export default function Signup() {
   const navigate = useNavigate();
@@ -25,17 +27,24 @@ export default function Signup() {
 
       const data = await res.json();
       if (!res.ok) {
-        setError(data?.error || "Signup failed");
+        setError(data?.error || data?.message || "Signup failed");
         setLoading(false);
         return;
       }
 
-      // If server returns token, store and navigate
-      if (data.token) {
-        localStorage.setItem("chat_token", data.token);
+      if (!data.token) {
+        // In case server doesn't return token for some reason
+        setError("Signup succeeded but no token returned. Please login.");
+        setLoading(false);
+        return;
       }
-      // redirect to dashboard
-      navigate("/dashboard");
+
+      // store token & optional user BEFORE navigating
+      setToken(data.token);
+      if (data.user) setUser(data.user);
+
+      // navigate to chatpage (consistent with login flow)
+      navigate("/chatpage", { replace: true });
     } catch (err) {
       console.error("Signup error:", err);
       setError("Network error");

@@ -1,7 +1,9 @@
+// src/pages/Login.jsx
 import React, { useState } from "react";
 import { motion } from "framer-motion";
 import { Lock } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+import { setToken, setUser } from "../utils/auth"; // adjust path if needed
 
 export default function Login() {
   const navigate = useNavigate();
@@ -22,18 +24,28 @@ export default function Login() {
       });
 
       const data = await res.json();
+
       if (!res.ok) {
-        setError(data?.error || "Login failed");
+        // server may return { error: '...' } or { message: '...' }
+        setError(data?.error || data?.message || "Login failed");
         setLoading(false);
         return;
       }
 
-      // store token and navigate
-      if (data.token) {
-        localStorage.setItem("chat_token", data.token);
+      // ensure token present
+      if (!data.token) {
+        setError("Login failed: no token returned");
+        setLoading(false);
+        return;
       }
-      // If server returned user object, you can store that too if needed
-      navigate("/dashboard");
+
+      // store token & optional user (synchronously) BEFORE navigation
+      console.log('Token from server:', data.token);
+      setToken(data.token);
+      if (data.user) setUser(data.user);
+
+      // navigate after storing token - use replace so back button doesn't return to login
+      navigate("/chatpage", { replace: true });
     } catch (err) {
       console.error("Login error:", err);
       setError("Network error");
