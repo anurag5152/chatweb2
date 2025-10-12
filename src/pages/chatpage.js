@@ -158,149 +158,161 @@ export default function ChatPage() {
   // API LOADERS
   // ----------------------------
   const loadFriends = (token) => {
-    fetch(`${API_URL}/friends`, {
-      headers: { ...authHeader(), Accept: "application/json" },
+  // server provides /conversations which lists 1:1 convs and other participant info
+  fetch(`${API_URL}/conversations`, {
+    headers: { ...authHeader(), Accept: "application/json" },
+  })
+    .then((r) => {
+      if (!r.ok) throw new Error('failed to load conversations');
+      return r.json();
     })
-      .then((r) => {
-        if (!r.ok) throw new Error("failed to load friends");
-        return r.json();
-      })
-      .then((data) => {
-        // server returns array of friends
-        setFriends(Array.isArray(data) ? data : data.friends || []);
-      })
-      .catch((err) => {
-        console.error("loadFriends error", err);
-      });
-  };
+    .then((data) => {
+      // server returns { conversations: [...] } per your server code
+      const convs = data.conversations || data;
+      // normalize to friend-like objects (id, name, email, conversation_id)
+      const friendsList = convs.map((c) => ({
+        id: c.other_user_id,
+        name: c.other_user_name,
+        email: c.other_user_email,
+        conversation_id: c.id,
+        created_at: c.created_at,
+      }));
+      setFriends(friendsList);
+    })
+    .catch((err) => {
+      console.error("loadFriends error", err);
+      setFriends([]);
+    });
+};
 
-  const loadRequests = (token) => {
-    fetch(`${API_URL}/friendRequests`, {
-      headers: { ...authHeader(), Accept: "application/json" },
+
+ const loadRequests = (token) => {
+  fetch(`${API_URL}/friends/requests`, {
+    headers: { ...authHeader(), Accept: "application/json" },
+  })
+    .then((r) => {
+      if (!r.ok) throw new Error('failed to load friend requests');
+      return r.json();
     })
-      .then((r) => {
-        if (!r.ok) throw new Error("failed to load requests");
-        return r.json();
-      })
-      .then((data) => {
-        // server might return { requests: [...] } or an array
-        if (Array.isArray(data)) {
-          setFriendRequests(data);
-        } else if (Array.isArray(data.requests)) {
-          setFriendRequests(data.requests);
-        } else {
-          setFriendRequests([]);
-        }
-      })
-      .catch((err) => {
-        console.error("loadRequests error", err);
-      });
-  };
+    .then((data) => {
+      // server returns { requests: [...] }
+      if (Array.isArray(data)) setFriendRequests(data);
+      else if (Array.isArray(data.requests)) setFriendRequests(data.requests);
+      else setFriendRequests([]);
+    })
+    .catch((err) => {
+      console.error("loadRequests error", err);
+      setFriendRequests([]);
+    });
+};
 
   // ----------------------------
   // SEARCH USERS
   // ----------------------------
-  useEffect(() => {
-    if (searchQuery.trim().length < 3) {
-      setSearchResults([]);
-      return;
-    }
-
-    const controller = new AbortController();
-    const token = getToken();
-    fetch(`${API_URL}/search?email=${encodeURIComponent(searchQuery)}`, {
-      headers: { ...authHeader(), Accept: "application/json" },
-      signal: controller.signal,
-    })
-      .then((r) => (r.ok ? r.json() : Promise.reject()))
-      .then((data) => {
-        // server might return array or { users: [...] }
+ useEffect(() => {
+  if (searchQuery.trim().length < 3) { setSearchResults([]); return; }
+  const controller = new AbortController();
+  const q = searchQuery.trim();
+  const t = setTimeout(() => {
+    const url = `${API_URL}/users/search?q=${encodeURIComponent(q)}`;
+    console.debug('[search] url=', url);
+    fetch(url, { headers: { ...authHeader(), Accept: "application/json" }, signal: controller.signal })
+      .then(res => {
+        console.debug('[search] status', res.status);
+        if (!res.ok) throw new Error(`search failed (${res.status})`);
+        return res.json();
+      })
+      .then(data => {
         if (Array.isArray(data)) setSearchResults(data);
         else if (Array.isArray(data.users)) setSearchResults(data.users);
         else setSearchResults([]);
       })
-      .catch(() => {
-        // ignore aborted / errors
+      .catch(err => {
+        if (err.name === 'AbortError') return;
+        console.error('[search] error', err);
+        setSearchResults([]);
       });
-
-    return () => controller.abort();
-  }, [searchQuery]);
+  }, 100);
+  return () => { clearTimeout(t); controller.abort(); };
+}, [searchQuery]);
 
   // ----------------------------
   // FRIEND REQUESTS
   // ----------------------------
   const handleSendFriendRequest = (email) => {
-    const token = getToken();
-    if (!token) {
-      navigate("/login", { replace: true });
-      return;
-    }
+  const token = getToken();
+  if (!token) {
+    navigate("/login", { replace: true });
+    return;
+  }
 
-    fetch(`${API_URL}/friendRequest`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...authHeader(),
-      },
-      body: JSON.stringify({ email }),
+  fetch(`${API_URL}/friends/request`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeader(),
+    },
+    body: JSON.stringify({ receiverEmail: email }),
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `request failed (${res.status})`);
+      }
+      return res.json();
     })
-      .then((res) => {
-        if (!res.ok) return res.json().then((d) => Promise.reject(d));
-        // refresh requests
-        loadRequests(token);
-      })
-      .catch((err) => {
-        console.error("send friend request err", err);
-        // optional: show UI error
-      });
-  };
+    .then((data) => {
+      // request successful; refresh friend requests list
+      loadRequests(token);
+      // optionally refresh friends/conversations (if server auto-created anything)
+      loadFriends(token);
+    })
+    .catch((err) => {
+      console.error("send friend request err", err);
+      // UI: you can show an error toast here
+    });
+};
 
-  const handleAcceptFriendRequest = (id) => {
-    const token = getToken();
-    fetch(`${API_URL}/friendRequest/${id}/accept`, {
-      method: "POST",
-      headers: { ...authHeader(), "Content-Type": "application/json" },
+// accept/reject via single respond endpoint
+const respondToFriendRequest = (requestId, action) => {
+  // action must be 'accept' or 'reject'
+  if (!['accept', 'reject'].includes(action)) return;
+  const token = getToken();
+  fetch(`${API_URL}/friends/respond`, {
+    method: "POST",
+    headers: { ...authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify({ requestId, action }),
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `respond failed (${res.status})`);
+      }
+      return res.json();
     })
-      .then((res) => {
-        if (!res.ok) return res.json().then((d) => Promise.reject(d));
-        // refresh lists
-        loadFriends(token);
-        loadRequests(token);
-      })
-      .catch((err) => {
-        console.error("accept friend err", err);
-      });
-  };
+    .then((data) => {
+      // refresh lists
+      loadFriends(token);
+      loadRequests(token);
+    })
+    .catch((err) => {
+      console.error('friends.respond err', err);
+    });
+};
 
-  const handleRejectFriendRequest = (id) => {
-    const token = getToken();
-    fetch(`${API_URL}/friendRequest/${id}/reject`, {
-      method: "POST",
-      headers: { ...authHeader(), "Content-Type": "application/json" },
-    })
-      .then((res) => {
-        if (!res.ok) return res.json().then((d) => Promise.reject(d));
-        loadRequests(token);
-      })
-      .catch((err) => {
-        console.error("reject friend err", err);
-      });
-  };
+const handleAcceptFriendRequest = (id) => respondToFriendRequest(id, 'accept');
+const handleRejectFriendRequest = (id) => respondToFriendRequest(id, 'reject');
 
-  const handleRemoveFriend = (friendId) => {
-    const token = getToken();
-    fetch(`${API_URL}/removeFriend/${friendId}`, {
-      method: "DELETE",
-      headers: { ...authHeader() },
-    })
-      .then((res) => {
-        if (!res.ok) return res.json().then((d) => Promise.reject(d));
-        loadFriends(token);
-      })
-      .catch((err) => {
-        console.error("remove friend err", err);
-      });
-  };
+// remove friend: your server doesn't have a 'remove friend' endpoint in the posted code.
+// If you implement one server-side, point this to that route. For now we'll optimistically
+// delete by removing the conversation (if you have an endpoint). If you don't have one,
+// simply reload conversations to reflect server state (no-op here).
+const handleRemoveFriend = (friendId) => {
+  // if you add a /friends/:id DELETE endpoint, call it here.
+  // fallback: just refresh conversation list (nothing removed server-side)
+  const token = getToken();
+  loadFriends(token);
+};
 
   // ----------------------------
   // MESSAGING
