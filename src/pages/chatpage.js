@@ -88,6 +88,7 @@ export default function ChatPage() {
   const connectSocket = (user, token) => {
     if (!token) return;
 
+    // Disconnect existing socket if any
     if (socket) {
       socket.off();
       socket.disconnect();
@@ -120,13 +121,32 @@ export default function ChatPage() {
       const convoId = normalized.conversation_id ?? normalized.conversationId ?? normalized.conversation;
 
       if (activeChatRef.current && convoId === activeChatRef.current.conversation_id) {
-        setMessages((prev) => [...prev, normalized]);
+        setMessages((prev) => {
+          // Check if there's an optimistic message with same content
+          const index = prev.findIndex(
+            (m) => m.id?.startsWith("tmp-") && m.content === normalized.content
+          );
+
+          if (index !== -1) {
+            // Replace optimistic with server-confirmed message
+            const updated = [...prev];
+            updated[index] = normalized;
+            return updated;
+          } else {
+            // Append normally
+            return [...prev, normalized];
+          }
+        });
+      } else {
+        // Handle messages for other chats here (like unread counts)
+        // incrementUnread(convoId);
       }
     };
 
     s.on("message", incomingHandler);
     s.on("receiveMessage", incomingHandler);
 
+    // Friend updates
     s.on("friendUpdate", () => {
       const t = getToken();
       if (t) {
@@ -317,6 +337,41 @@ export default function ChatPage() {
     navigate("/login", { replace: true });
   };
 
+  const handleRemoveFriend = async (friendId) => {
+    const token = getToken();
+    if (!token) return;
+
+    try {
+      const res = await fetch(`${API_URL}/friends/remove`, {
+        method: "POST",
+        headers: {
+          ...authHeader(),
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ friendId }),
+      });
+
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `Failed to remove friend (${res.status})`);
+      }
+
+      // Refresh friends list after removal
+      loadFriends(token);
+
+      // Optional: clear active chat if the removed friend is currently selected
+      if (activeChat?.id === friendId) {
+        setActiveChat(null);
+        setMessages([]);
+      }
+
+    } catch (err) {
+      console.error("Remove friend error:", err);
+      alert("Failed to remove friend. Try again.");
+    }
+  };
+
+
   // ----------------------------
   // RENDER
   // ----------------------------
@@ -419,14 +474,22 @@ export default function ChatPage() {
                 <li
                   key={f.id}
                   onClick={() => selectFriend(f)}
-                  className={`flex items-center justify-between p-2 rounded cursor-pointer hover:bg-[#07171b] ${
-                    activeChat?.id === f.id ? "bg-[#07171b] border-l-4 border-[#00FF99]" : ""
-                  }`}
+                  className={`flex items-center justify-between p-2 rounded cursor-pointer hover:bg-[#07171b] ${activeChat?.id === f.id ? "bg-[#07171b] border-l-4 border-[#00FF99]" : ""
+                    }`}
                 >
                   <div>
                     <div className="font-medium">{f.name}</div>
                     <div className="text-xs text-gray-400">{f.email}</div>
                   </div>
+                  <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleRemoveFriend(f.id);
+                      }}
+                      className="text-xs px-2 py-1 bg-[#220000] rounded"
+                    >
+                      Remove
+                    </button>
                 </li>
               ))}
             </ul>

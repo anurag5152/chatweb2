@@ -392,6 +392,53 @@ app.get('/friends/requests', authMiddleware, async (req, res) => {
   }
 });
 
+// POST /friends/remove
+app.post("/friends/remove", authMiddleware, async (req, res) => {
+  const { friendId } = req.body;
+  const userId = req.user.id; // set by auth middleware
+
+  if (!friendId) return res.status(400).json({ error: "Missing friendId" });
+
+  try {
+    // 1️⃣ Remove friendship
+    await pool.query(
+      `DELETE FROM friendships 
+       WHERE (user_a = $1 AND user_b = $2) OR (user_a = $2 AND user_b = $1)`,
+      [userId, friendId]
+    );
+
+    // 2️⃣ Find the conversation between the two users
+    const convoRes = await pool.query(
+      `SELECT id FROM conversations 
+       WHERE (user_a = $1 AND user_b = $2) OR (user_a = $2 AND user_b = $1)`,
+      [userId, friendId]
+    );
+
+    if (convoRes.rows.length > 0) {
+      const convoId = convoRes.rows[0].id;
+
+      // 3️⃣ Delete all messages in that conversation
+      await pool.query(`DELETE FROM messages WHERE conversation_id = $1`, [convoId]);
+
+      // 4️⃣ Delete the conversation itself
+      await pool.query(`DELETE FROM conversations WHERE id = $1`, [convoId]);
+    }
+
+    // 5️⃣ Notify both users via Socket.IO
+    if (io) { // io is your socket server instance
+      io.to(userId.toString()).emit("friendUpdate");
+      io.to(friendId.toString()).emit("friendUpdate");
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Remove friend + chat error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
 // List user's 1:1 conversations and other participant info
 app.get('/conversations', authMiddleware, async (req, res) => {
   const uid = req.user.id;
