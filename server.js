@@ -1,7 +1,6 @@
 // server.js - robust minimal chat backend with Socket.IO
 require('dotenv').config();
 const express = require('express');
-const bodyParser = require('body-parser');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const path = require('path');
@@ -13,144 +12,152 @@ const cors = require('cors');
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Middleware
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
-app.use(cors());
+// Basic middleware
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(cors({ origin: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Postgres pool
 const pool = new Pool({
   user: process.env.DB_USER,
-  host: process.env.DB_HOST,
+  host: process.env.DB_HOST || 'localhost',
   database: process.env.DB_NAME,
   password: process.env.DB_PASSWORD,
-  port: process.env.DB_PORT,
+  port: process.env.DB_PORT || 5432,
 });
 
 // Robust DB init: create tables if missing, add missing columns/constraints if table exists
 async function initDb() {
-  // users
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
-
-  // friend_requests
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS friend_requests (
-      id SERIAL PRIMARY KEY,
-      requester_id INT NOT NULL,
-      receiver_id INT NOT NULL,
-      status VARCHAR(20) NOT NULL DEFAULT 'pending',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      UNIQUE (requester_id, receiver_id)
-    );
-  `);
-
-  // add FK constraints for friend_requests if missing (best-effort)
   try {
+    // users
     await pool.query(`
-      ALTER TABLE friend_requests
-      ADD CONSTRAINT fr_req_fk_requester FOREIGN KEY (requester_id) REFERENCES users(id) ON DELETE CASCADE;
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
     `);
-  } catch (e) { /* ignore if exists */ }
 
-  try {
+    // friend_requests
     await pool.query(`
-      ALTER TABLE friend_requests
-      ADD CONSTRAINT fr_req_fk_receiver FOREIGN KEY (receiver_id) REFERENCES users(id) ON DELETE CASCADE;
+      CREATE TABLE IF NOT EXISTS friend_requests (
+        id SERIAL PRIMARY KEY,
+        requester_id INT NOT NULL,
+        receiver_id INT NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (requester_id, receiver_id)
+      );
     `);
-  } catch (e) { /* ignore if exists */ }
 
-  // conversations table (1:1). Create if not exists.
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS conversations (
-      id SERIAL PRIMARY KEY
-      -- user_a, user_b, created_at added/ensured below to be robust for existing mismatched schemas
-    );
-  `);
+    // add FK constraints for friend_requests if missing (best-effort)
+    try {
+      await pool.query(`
+        ALTER TABLE friend_requests
+        ADD CONSTRAINT fr_req_fk_requester FOREIGN KEY (requester_id) REFERENCES users(id) ON DELETE CASCADE;
+      `);
+    } catch (e) { /* ignore if exists */ }
 
-  // ensure columns user_a, user_b, created_at exist (if not, add them)
-  const colCheck = async (col) => {
-    const r = await pool.query(
-      `SELECT column_name FROM information_schema.columns WHERE table_name='conversations' AND column_name=$1`,
-      [col]
-    );
-    return r.rowCount > 0;
-  };
+    try {
+      await pool.query(`
+        ALTER TABLE friend_requests
+        ADD CONSTRAINT fr_req_fk_receiver FOREIGN KEY (receiver_id) REFERENCES users(id) ON DELETE CASCADE;
+      `);
+    } catch (e) { /* ignore if exists */ }
 
-  if (!(await colCheck('user_a'))) {
-    await pool.query(`ALTER TABLE conversations ADD COLUMN user_a INT;`);
+    // conversations table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS conversations (
+        id SERIAL PRIMARY KEY
+        -- user_a, user_b, created_at may be added below if missing
+      );
+    `);
+
+    // helper to check column existence
+    const colCheck = async (col) => {
+      const r = await pool.query(
+        `SELECT column_name FROM information_schema.columns WHERE table_name='conversations' AND column_name=$1`,
+        [col]
+      );
+      return r.rowCount > 0;
+    };
+
+    if (!(await colCheck('user_a'))) {
+      await pool.query(`ALTER TABLE conversations ADD COLUMN user_a INT;`);
+    }
+    if (!(await colCheck('user_b'))) {
+      await pool.query(`ALTER TABLE conversations ADD COLUMN user_b INT;`);
+    }
+    if (!(await colCheck('created_at'))) {
+      await pool.query(`ALTER TABLE conversations ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now();`);
+    }
+
+    // add FK constraints for conversations if missing
+    try {
+      await pool.query(`
+        ALTER TABLE conversations
+        ADD CONSTRAINT conv_fk_usera FOREIGN KEY (user_a) REFERENCES users(id) ON DELETE CASCADE;
+      `);
+    } catch (e) { /* ignore if exists */ }
+
+    try {
+      await pool.query(`
+        ALTER TABLE conversations
+        ADD CONSTRAINT conv_fk_userb FOREIGN KEY (user_b) REFERENCES users(id) ON DELETE CASCADE;
+      `);
+    } catch (e) { /* ignore if exists */ }
+
+    // create unique index on ordered pair to prevent duplicate 1:1 convs (LEAST/GREATEST)
+    // Make sure user_a and user_b exist before creating the index
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_conversations_user_pair
+      ON conversations (LEAST(user_a, user_b), GREATEST(user_a, user_b));
+    `);
+
+    // messages
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id BIGSERIAL PRIMARY KEY,
+        conversation_id INT NOT NULL,
+        sender_id INT NOT NULL,
+        content TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    // add FK constraints for messages if missing
+    try {
+      await pool.query(`
+        ALTER TABLE messages
+        ADD CONSTRAINT msg_fk_conv FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE;
+      `);
+    } catch (e) { /* ignore if exists */ }
+
+    try {
+      await pool.query(`
+        ALTER TABLE messages
+        ADD CONSTRAINT msg_fk_sender FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE;
+      `);
+    } catch (e) { /* ignore if exists */ }
+
+    // index for fast message retrieval
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at DESC);`);
+
+    console.log('DB init complete');
+  } catch (err) {
+    console.error('DB init error', err && err.stack ? err.stack : err);
+    throw err;
   }
-  if (!(await colCheck('user_b'))) {
-    await pool.query(`ALTER TABLE conversations ADD COLUMN user_b INT;`);
-  }
-  if (!(await colCheck('created_at'))) {
-    await pool.query(`ALTER TABLE conversations ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now();`);
-  }
-
-  // add FK constraints for conversations if missing
-  try {
-    await pool.query(`
-      ALTER TABLE conversations
-      ADD CONSTRAINT conv_fk_usera FOREIGN KEY (user_a) REFERENCES users(id) ON DELETE CASCADE;
-    `);
-  } catch (e) { /* ignore if exists */ }
-
-  try {
-    await pool.query(`
-      ALTER TABLE conversations
-      ADD CONSTRAINT conv_fk_userb FOREIGN KEY (user_b) REFERENCES users(id) ON DELETE CASCADE;
-    `);
-  } catch (e) { /* ignore if exists */ }
-
-  // create unique index on ordered pair to prevent duplicate 1:1 convs (LEAST/GREATEST)
-  await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_conversations_user_pair
-    ON conversations (LEAST(user_a, user_b), GREATEST(user_a, user_b));
-  `);
-
-  // messages
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id BIGSERIAL PRIMARY KEY,
-      conversation_id INT NOT NULL,
-      sender_id INT NOT NULL,
-      content TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
-
-  // add FK constraints for messages if missing
-  try {
-    await pool.query(`
-      ALTER TABLE messages
-      ADD CONSTRAINT msg_fk_conv FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE;
-    `);
-  } catch (e) { /* ignore if exists */ }
-
-  try {
-    await pool.query(`
-      ALTER TABLE messages
-      ADD CONSTRAINT msg_fk_sender FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE;
-    `);
-  } catch (e) { /* ignore if exists */ }
-
-  // index for fast message retrieval
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at DESC);`);
 }
 
 // run initDb robustly
 initDb()
   .then(() => console.log('DB ready'))
   .catch((e) => {
-    console.error('DB init error', e);
+    console.error('DB init failed, exiting', e && e.stack ? e.stack : e);
     process.exit(1);
   });
 
@@ -175,13 +182,18 @@ function clientWantsJson(req) {
 
 // auth middleware for REST
 async function authMiddleware(req, res, next) {
-  const header = req.headers['authorization'];
-  const token = header && header.startsWith('Bearer ') ? header.split(' ')[1] : (req.body?.token || req.query?.token);
-  if (!token) return res.status(401).json({ error: 'No token' });
-  const payload = verifyToken(token);
-  if (!payload) return res.status(401).json({ error: 'Invalid token' });
-  req.user = { id: payload.userId, email: payload.email };
-  next();
+  try {
+    const header = req.headers['authorization'];
+    const token = header && header.startsWith('Bearer ') ? header.split(' ')[1] : (req.body?.token || req.query?.token);
+    if (!token) return res.status(401).json({ error: 'No token' });
+    const payload = verifyToken(token);
+    if (!payload) return res.status(401).json({ error: 'Invalid token' });
+    req.user = { id: payload.userId, email: payload.email };
+    next();
+  } catch (err) {
+    console.error('auth middleware error', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'Server error' });
+  }
 }
 
 // Routes
@@ -207,7 +219,7 @@ app.post('/signup', async (req, res) => {
       return res.redirect('/login.html');
     }
   } catch (err) {
-    console.error('signup error', err);
+    console.error('signup error', err && err.stack ? err.stack : err);
     if (err.code === '23505') {
       if (wantsJson) return res.status(409).json({ error: 'Email already exists' });
       return res.status(409).send('Email already exists');
@@ -244,23 +256,23 @@ app.post('/login', async (req, res) => {
       return res.redirect('/dashboard.html');
     }
   } catch (err) {
-    console.error('login error', err);
+    console.error('login error', err && err.stack ? err.stack : err);
     if (wantsJson) return res.status(500).json({ error: 'Server error' });
     return res.status(500).send('Server error');
   }
 });
 
 app.get('/me', authMiddleware, async (req, res) => {
-    try {
-        const r = await pool.query('SELECT id, name, email FROM users WHERE id=$1', [req.user.id]);
-        if (r.rowCount === 0) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-        res.json(r.rows[0]);
-    } catch (err) {
-        console.error('me error', err);
-        res.status(500).json({ error: 'Server error' });
+  try {
+    const r = await pool.query('SELECT id, name, email FROM users WHERE id=$1', [req.user.id]);
+    if (r.rowCount === 0) {
+      return res.status(404).json({ error: 'User not found' });
     }
+    res.json(r.rows[0]);
+  } catch (err) {
+    console.error('me error', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // Search users by q (email or name)
@@ -271,7 +283,7 @@ app.get('/users/search', authMiddleware, async (req, res) => {
     const r = await pool.query('SELECT id, name, email FROM users WHERE email ILIKE $1 OR name ILIKE $1 LIMIT 20', [`%${q}%`]);
     res.json({ users: r.rows });
   } catch (err) {
-    console.error('search error', err);
+    console.error('search error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -290,24 +302,40 @@ app.post('/friends/request', authMiddleware, async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'Request already exists' });
-    console.error('friend request error', err);
+    console.error('friend request error', err && err.stack ? err.stack : err);
     return res.status(500).json({ error: 'Server error' });
   }
 });
 
 // Respond to friend request (accept / reject). Body: { requestId, action }
 app.post('/friends/respond', authMiddleware, async (req, res) => {
-  const userId = req.user.id;
-  const { requestId, action } = req.body;
-  if (!requestId || !action) return res.status(400).json({ error: 'requestId and action required' });
+  // coerce & validate inputs immediately
+  const userId = Number(req.user.id);
+  const requestId = Number(req.body?.requestId);
+  const action = (req.body?.action || '').toString();
+
+  if (!Number.isFinite(requestId) || requestId <= 0) {
+    return res.status(400).json({ error: 'invalid requestId' });
+  }
+  if (!Number.isFinite(userId) || userId <= 0) {
+    return res.status(401).json({ error: 'invalid user' });
+  }
+  if (!action) return res.status(400).json({ error: 'requestId and action required' });
   if (!['accept', 'reject'].includes(action)) return res.status(400).json({ error: 'invalid action' });
 
   const client = await pool.connect();
   try {
+    // make sure to pass integers into the query params
     const rq = await client.query('SELECT * FROM friend_requests WHERE id=$1 AND receiver_id=$2', [requestId, userId]);
-    if (rq.rowCount === 0) return res.status(404).json({ error: 'friend request not found' });
+    if (rq.rowCount === 0) {
+      return res.status(404).json({ error: 'friend request not found' });
+    }
 
-    const requesterId = rq.rows[0].requester_id;
+    const requesterId = Number(rq.rows[0].requester_id);
+    if (!Number.isFinite(requesterId)) {
+      // defensive: unexpected DB state
+      return res.status(500).json({ error: 'invalid requester id in DB' });
+    }
 
     if (action === 'reject') {
       await client.query('UPDATE friend_requests SET status=$1 WHERE id=$2', ['rejected', requestId]);
@@ -318,10 +346,10 @@ app.post('/friends/respond', authMiddleware, async (req, res) => {
     await client.query('BEGIN');
     await client.query('UPDATE friend_requests SET status=$1 WHERE id=$2', ['accepted', requestId]);
 
-    // find existing conversation (ordered pair)
+    // find existing conversation (ordered pair) — ensure params are integers
     const convCheck = await client.query(
       `SELECT id FROM conversations
-       WHERE LEAST(user_a, user_b) = LEAST($1,$2) AND GREATEST(user_a, user_b) = GREATEST($1,$2) LIMIT 1`,
+       WHERE LEAST(user_a, user_b) = LEAST($1::int,$2::int) AND GREATEST(user_a, user_b) = GREATEST($1::int,$2::int) LIMIT 1`,
       [requesterId, userId]
     );
 
@@ -334,10 +362,12 @@ app.post('/friends/respond', authMiddleware, async (req, res) => {
     }
 
     await client.query('COMMIT');
+
+    // success — respond with conversation id if created/found
     return res.json({ ok: true, status: 'accepted', conversationId });
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('friends.respond error', err);
+    try { await client.query('ROLLBACK'); } catch (e) {}
+    console.error('friends.respond error', err && err.stack ? err.stack : err);
     return res.status(500).json({ error: 'Server error' });
   } finally {
     client.release();
@@ -357,7 +387,7 @@ app.get('/friends/requests', authMiddleware, async (req, res) => {
     );
     res.json({ requests: r.rows });
   } catch (err) {
-    console.error('list requests error', err);
+    console.error('list requests error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -379,7 +409,7 @@ app.get('/conversations', authMiddleware, async (req, res) => {
     );
     res.json({ conversations: r.rows });
   } catch (err) {
-    console.error('get conversations error', err);
+    console.error('get conversations error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -403,7 +433,7 @@ app.get('/conversations/:id/messages', authMiddleware, async (req, res) => {
     );
     res.json({ messages: msgs.rows });
   } catch (err) {
-    console.error('fetch messages error', err);
+    console.error('fetch messages error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -427,23 +457,32 @@ app.post('/conversations/:id/messages', authMiddleware, async (req, res) => {
 
     return res.json({ message });
   } catch (err) {
-    console.error('post message error', err);
+    console.error('post message error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
 // HTTP server + Socket.IO
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
 
-// Socket auth via JWT in handshake.auth.token
+// socket.io with permissive CORS for local dev
+const io = new Server(server, {
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+});
+
+// Socket auth via JWT in handshake.auth.token or Authorization header
 io.use((socket, next) => {
-  const token = socket.handshake.auth?.token || (socket.handshake.headers?.authorization ? socket.handshake.headers.authorization.split(' ')[1] : null);
-  if (!token) return next(new Error('auth error: token missing'));
-  const payload = verifyToken(token);
-  if (!payload) return next(new Error('auth error: invalid token'));
-  socket.userId = payload.userId;
-  next();
+  try {
+    const token = socket.handshake.auth?.token || (socket.handshake.headers?.authorization ? socket.handshake.headers.authorization.split(' ')[1] : null);
+    if (!token) return next(new Error('auth error: token missing'));
+    const payload = verifyToken(token);
+    if (!payload) return next(new Error('auth error: invalid token'));
+    socket.userId = payload.userId;
+    next();
+  } catch (err) {
+    console.error('socket auth error', err && err.stack ? err.stack : err);
+    next(new Error('auth error'));
+  }
 });
 
 io.on('connection', (socket) => {
@@ -462,7 +501,7 @@ io.on('connection', (socket) => {
       socket.join(`conversation:${conversationId}`);
       socket.emit('joined', { conversationId });
     } catch (err) {
-      console.error('join err', err);
+      console.error('join err', err && err.stack ? err.stack : err);
       socket.emit('error', 'join failed');
     }
   });
@@ -491,7 +530,7 @@ io.on('connection', (socket) => {
 
       io.to(`conversation:${conversationId}`).emit('message', message);
     } catch (err) {
-      console.error('socket sendMessage err', err);
+      console.error('socket sendMessage err', err && err.stack ? err.stack : err);
       socket.emit('error', 'send failed');
     }
   });
@@ -504,4 +543,13 @@ io.on('connection', (socket) => {
 // Start server
 server.listen(port, () => {
   console.log(`Server listening http://localhost:${port}`);
+});
+
+// catch unhandled rejections / exceptions for easier debugging in dev
+process.on('unhandledRejection', (reason, p) => {
+  console.error('Unhandled Rejection at Promise', p, 'reason:', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception thrown', err && err.stack ? err.stack : err);
+  // in production you might want to exit process; for dev we keep running for convenience
 });
