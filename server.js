@@ -18,14 +18,34 @@ app.use(express.urlencoded({ extended: true }));
 app.use(cors({ origin: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Postgres pool
-const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST || 'localhost',
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASSWORD,
-  port: process.env.DB_PORT || 5432,
-});
+// Postgres pool (supports DATABASE_URL or individual vars)
+let pool;
+if (process.env.DATABASE_URL) {
+  pool = new Pool({ connectionString: process.env.DATABASE_URL });
+} else {
+  const dbUser = process.env.DB_USER;
+  const dbHost = process.env.DB_HOST || 'localhost';
+  const dbName = process.env.DB_NAME;
+  const dbPassword = process.env.DB_PASSWORD; // not logged
+  const dbPort = Number(process.env.DB_PORT || 5432);
+
+  // Fail fast if database is not configured
+  if (!dbName || !dbUser) {
+    console.error('[DB CONFIG] Missing DB_NAME or DB_USER. Please set env vars or DATABASE_URL.');
+    process.exit(1);
+  }
+
+  // Log sanitized DB config for verification (no secrets)
+  console.log('[DB CONFIG]', { host: dbHost, port: dbPort, database: dbName, user: dbUser });
+
+  pool = new Pool({
+    user: dbUser,
+    host: dbHost,
+    database: dbName,
+    password: dbPassword,
+    port: dbPort,
+  });
+}
 
 // Robust DB init: create tables if missing, add missing columns/constraints if table exists
 async function initDb() {
@@ -280,8 +300,13 @@ app.get('/users/search', authMiddleware, async (req, res) => {
   const q = (req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q param required' });
   try {
-    const r = await pool.query('SELECT id, name, email FROM users WHERE email ILIKE $1 OR name ILIKE $1 LIMIT 20', [`%${q}%`]);
-    res.json({ users: r.rows });
+    const emailResults = await pool.query('SELECT id, name, email FROM users WHERE email ILIKE $1 LIMIT 10', [`%${q}%`]);
+    const nameResults = await pool.query('SELECT id, name, email FROM users WHERE name ILIKE $1 LIMIT 10', [`%${q}%`]);
+
+    const combined = [...emailResults.rows, ...nameResults.rows];
+    const uniqueUsers = Array.from(new Map(combined.map(user => [user.id, user])).values());
+
+    res.json({ users: uniqueUsers });
   } catch (err) {
     console.error('search error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: 'Server error' });
@@ -298,10 +323,22 @@ app.post('/friends/request', authMiddleware, async (req, res) => {
     if (r.rowCount === 0) return res.status(404).json({ error: 'User not found' });
     const receiverId = r.rows[0].id;
     if (receiverId === requesterId) return res.status(400).json({ error: 'Cannot friend yourself' });
-    await pool.query('INSERT INTO friend_requests (requester_id, receiver_id) VALUES ($1,$2)', [requesterId, receiverId]);
+    // Upsert into friend_requests to avoid 409s and make operation idempotent
+    await pool.query(
+      `INSERT INTO friend_requests (requester_id, receiver_id, status)
+       VALUES ($1,$2,'pending')
+       ON CONFLICT (requester_id, receiver_id)
+       DO UPDATE SET status='pending'`,
+      [requesterId, receiverId]
+    );
+
+    // Notify both parties
+    try {
+      io.to(`user:${receiverId}`).emit('friendUpdate');
+      io.to(`user:${requesterId}`).emit('friendUpdate');
+    } catch (e) { /* ignore */ }
     return res.json({ ok: true });
   } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'Request already exists' });
     console.error('friend request error', err && err.stack ? err.stack : err);
     return res.status(500).json({ error: 'Server error' });
   }
@@ -364,6 +401,10 @@ app.post('/friends/respond', authMiddleware, async (req, res) => {
     await client.query('COMMIT');
 
     // success — respond with conversation id if created/found
+    try {
+      io.to(`user:${requesterId}`).emit('friendUpdate');
+      io.to(`user:${userId}`).emit('friendUpdate');
+    } catch (e) { /* ignore */ }
     return res.json({ ok: true, status: 'accepted', conversationId });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (e) {}
@@ -395,44 +436,42 @@ app.get('/friends/requests', authMiddleware, async (req, res) => {
 // POST /friends/remove
 app.post("/friends/remove", authMiddleware, async (req, res) => {
   const { friendId } = req.body;
-  const userId = req.user.id; // set by auth middleware
+  const userId = Number(req.user.id);
+  const otherId = Number(friendId);
 
-  if (!friendId) return res.status(400).json({ error: "Missing friendId" });
+  if (!Number.isFinite(otherId)) return res.status(400).json({ error: "Missing friendId" });
 
   try {
-    // 1️⃣ Remove friendship
+    // Delete any pending friend_requests in either direction
     await pool.query(
-      `DELETE FROM friendships 
-       WHERE (user_a = $1 AND user_b = $2) OR (user_a = $2 AND user_b = $1)`,
-      [userId, friendId]
+      `DELETE FROM friend_requests WHERE (requester_id=$1 AND receiver_id=$2) OR (requester_id=$2 AND receiver_id=$1)`,
+      [userId, otherId]
     );
 
-    // 2️⃣ Find the conversation between the two users
+    // Find the conversation between the two users
     const convoRes = await pool.query(
       `SELECT id FROM conversations 
-       WHERE (user_a = $1 AND user_b = $2) OR (user_a = $2 AND user_b = $1)`,
-      [userId, friendId]
+       WHERE LEAST(user_a, user_b) = LEAST($1::int,$2::int) AND GREATEST(user_a, user_b) = GREATEST($1::int,$2::int)
+       LIMIT 1`,
+      [userId, otherId]
     );
 
-    if (convoRes.rows.length > 0) {
+    if (convoRes.rowCount > 0) {
       const convoId = convoRes.rows[0].id;
-
-      // 3️⃣ Delete all messages in that conversation
-      await pool.query(`DELETE FROM messages WHERE conversation_id = $1`, [convoId]);
-
-      // 4️⃣ Delete the conversation itself
+      // Defensive: delete messages explicitly, then conversation
+      try { await pool.query(`DELETE FROM messages WHERE conversation_id = $1`, [convoId]); } catch (e) { /* ignore */ }
       await pool.query(`DELETE FROM conversations WHERE id = $1`, [convoId]);
     }
 
-    // 5️⃣ Notify both users via Socket.IO
-    if (io) { // io is your socket server instance
-      io.to(userId.toString()).emit("friendUpdate");
-      io.to(friendId.toString()).emit("friendUpdate");
-    }
+    // Notify both users via Socket.IO
+    try {
+      io.to(`user:${userId}`).emit('friendUpdate');
+      io.to(`user:${otherId}`).emit('friendUpdate');
+    } catch (e) { /* ignore */ }
 
     res.json({ success: true });
   } catch (err) {
-    console.error("Remove friend + chat error:", err);
+    console.error("Remove friend + chat error:", err && err.stack ? err.stack : err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -535,6 +574,8 @@ io.use((socket, next) => {
 io.on('connection', (socket) => {
   const uid = socket.userId;
   console.log(`socket connected ${socket.id} user ${uid}`);
+  // Join a stable per-user room for targeted events
+  try { socket.join(`user:${uid}`); } catch (e) { /* noop */ }
 
   // join conversation room
   socket.on('join', async ({ conversationId }) => {

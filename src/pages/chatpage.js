@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { io } from "socket.io-client";
 import { useNavigate } from "react-router-dom";
-import { getToken, removeToken, authHeader, getUser } from "../utils/auth";
+import { getToken, removeToken, authHeader, getUser, setUser, removeUser } from "../utils/auth";
 
 const API_URL = process.env.REACT_APP_API_URL || "http://localhost:5000";
 const SOCKET_URL = API_URL;
@@ -64,6 +64,7 @@ export default function ChatPage() {
       })
       .then((user) => {
         setCurrentUser(user);
+        try { setUser(user); } catch {}
         connectSocket(user, token);
         loadFriends(token);
         loadRequests(token);
@@ -86,77 +87,77 @@ export default function ChatPage() {
   // SOCKET CONNECTION
   // ----------------------------
   const connectSocket = (user, token) => {
-    if (!token) return;
+  if (!token) return;
 
-    // Disconnect existing socket if any
-    if (socket) {
-      socket.off();
-      socket.disconnect();
-      setSocket(null);
-    }
+  // Disconnect existing socket if any
+  if (socket) {
+    socket.off();
+    socket.disconnect();
+    setSocket(null);
+  }
 
-    const s = io(SOCKET_URL, {
-      auth: { token },
-      reconnectionAttempts: 10,
-      reconnectionDelay: 1000,
-    });
+  const s = io(SOCKET_URL, {
+    auth: { token },
+    reconnectionAttempts: 10,
+    reconnectionDelay: 1000,
+  });
 
-    s.on("connect", () => {
-      console.log("Socket connected:", s.id);
-      setSocketConnected(true);
+  s.on("connect", () => {
+    console.log("Socket connected:", s.id);
+    setSocketConnected(true);
 
-      // Rejoin all previously joined rooms on reconnect
-      joinedConvosRef.current.forEach((cid) => s.emit("join", { conversationId: cid }));
-    });
+    // Rejoin all previously joined rooms on reconnect
+    joinedConvosRef.current.forEach((cid) => s.emit("join", { conversationId: cid }));
+  });
 
-    s.on("disconnect", () => setSocketConnected(false));
-    s.on("connect_error", (err) => console.warn("Socket connect error:", err?.message || err));
+  s.on("disconnect", () => setSocketConnected(false));
+  s.on("connect_error", (err) => console.warn("Socket connect error:", err?.message || err));
 
-    // Incoming message handler
-    const incomingHandler = (msg) => {
-      const normalized = {
-        ...msg,
-        timestamp: msg.timestamp || msg.created_at || new Date().toISOString(),
-      };
-      const convoId = normalized.conversation_id ?? normalized.conversationId ?? normalized.conversation;
-
-      if (activeChatRef.current && convoId === activeChatRef.current.conversation_id) {
-        setMessages((prev) => {
-          // Check if there's an optimistic message with same content
-          const index = prev.findIndex(
-            (m) => m.id?.startsWith("tmp-") && m.content === normalized.content
-          );
-
-          if (index !== -1) {
-            // Replace optimistic with server-confirmed message
-            const updated = [...prev];
-            updated[index] = normalized;
-            return updated;
-          } else {
-            // Append normally
-            return [...prev, normalized];
-          }
-        });
-      } else {
-        // Handle messages for other chats here (like unread counts)
-        // incrementUnread(convoId);
-      }
+  // Incoming message handler
+  const incomingHandler = (msg) => {
+    const normalized = {
+      ...msg,
+      timestamp: msg.timestamp || msg.created_at || new Date().toISOString(),
     };
+    const convoId = normalized.conversation_id ?? normalized.conversationId ?? normalized.conversation;
 
-    s.on("message", incomingHandler);
-    s.on("receiveMessage", incomingHandler);
+    if (activeChatRef.current && convoId === activeChatRef.current.conversation_id) {
+      setMessages((prev) => {
+        // Check if there's an optimistic message with same content
+        const index = prev.findIndex(
+          (m) => m.id?.startsWith("tmp-") && m.content === normalized.content
+        );
 
-    // Friend updates
-    s.on("friendUpdate", () => {
-      const t = getToken();
-      if (t) {
-        loadFriends(t);
-        loadRequests(t);
-      }
-    });
-
-    setSocket(s);
+        if (index !== -1) {
+          // Replace optimistic with server-confirmed message
+          const updated = [...prev];
+          updated[index] = normalized;
+          return updated;
+        } else {
+          // Append normally
+          return [...prev, normalized];
+        }
+      });
+    } else {
+      // Handle messages for other chats here (like unread counts)
+      // incrementUnread(convoId);
+    }
   };
+
+  s.on("message", incomingHandler);
+  s.on("receiveMessage", incomingHandler);
+
+  // Friend updates
+  s.on("friendUpdate", () => {
+    const t = getToken();
+    if (t) {
+      loadFriends(t);
+      loadRequests(t);
+    }
+  });
+
+  setSocket(s);
+};
 
   // ----------------------------
   // API LOADERS
@@ -193,23 +194,46 @@ export default function ChatPage() {
   // SEARCH USERS
   // ----------------------------
   useEffect(() => {
-    if (searchQuery.trim().length < 3) {
+    const query = searchQuery.trim();
+    if (query.length < 3) {
       setSearchResults([]);
       return;
     }
+
     const controller = new AbortController();
-    const q = searchQuery.trim();
+    const isEmailLike = query.includes('@');
+    const isFullEmail = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(query);
+
+    const endpoint = `${API_URL}/users/search?q=${encodeURIComponent(query)}`;
+
     const timeout = setTimeout(() => {
-      fetch(`${API_URL}/users/search?q=${encodeURIComponent(q)}`, {
+      fetch(endpoint, {
         headers: { ...authHeader(), Accept: "application/json" },
         signal: controller.signal,
       })
         .then((res) => (res.ok ? res.json() : []))
-        .then((users) =>
-          setSearchResults(users.filter((u) => u.email.toLowerCase() !== currentUser.email.toLowerCase()))
-        )
-        .catch(() => setSearchResults([]));
-    }, 150);
+        .then((data) => {
+          const users = Array.isArray(data) ? data : (data?.users || []);
+
+          let filtered = users.filter((u) => u && u.email);
+
+          // Exclude current user safely
+          const me = currentUser?.email?.toLowerCase();
+          if (me) filtered = filtered.filter((u) => u.email.toLowerCase() !== me);
+
+          // If a full email is typed, only show exact match
+          if (isEmailLike && isFullEmail) {
+            const ql = query.toLowerCase();
+            filtered = filtered.filter((u) => u.email.toLowerCase() === ql);
+          }
+
+          setSearchResults(filtered);
+        })
+        .catch(() => {
+          // Treat errors (including 404s) as no results; avoid noisy console
+          setSearchResults([]);
+        });
+    }, 300);
 
     return () => {
       clearTimeout(timeout);
@@ -224,19 +248,32 @@ export default function ChatPage() {
     const token = getToken();
     if (!token) return navigate("/login", { replace: true });
 
-    setSendingFriendEmail(email.toLowerCase());
+    // Optimistic mark as requested
+    const lower = email.toLowerCase();
+    setSearchResults((prev) => prev.map((u) => (u.email.toLowerCase() === lower ? { ...u, requested: true } : u)));
+    setSendingFriendEmail(lower);
+
     fetch(`${API_URL}/friends/request`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeader() },
       body: JSON.stringify({ receiverEmail: email }),
     })
-      .then((res) => res.json())
+      .then(async (res) => {
+        // Treat 409 (already exists) as success to keep UI consistent
+        if (res.status === 409) return { ok: true, already: true };
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err?.error || "Request failed");
+        }
+        return res.json();
+      })
       .then(() => {
-        setSearchResults((prev) =>
-          prev.map((u) => (u.email.toLowerCase() === email.toLowerCase() ? { ...u, requested: true } : u))
-        );
         loadRequests(token);
         loadFriends(token);
+      })
+      .catch(() => {
+        // Revert optimistic change on hard error (not 409)
+        setSearchResults((prev) => prev.map((u) => (u.email.toLowerCase() === lower ? { ...u, requested: false } : u)));
       })
       .finally(() => setSendingFriendEmail(null));
   };
@@ -260,6 +297,35 @@ export default function ChatPage() {
 
   const handleAcceptFriendRequest = (id) => respondToFriendRequest(id, "accept");
   const handleRejectFriendRequest = (id) => respondToFriendRequest(id, "reject");
+
+  // Remove friend (also deletes conversation + messages server-side)
+  const handleRemoveFriend = async (friend) => {
+    const token = getToken();
+    if (!token || !friend?.id) return;
+
+    // Optimistic: remove from list and clear active chat if matches
+    setFriends((prev) => prev.filter((f) => f.id !== friend.id));
+    if (activeChat?.id === friend.id) {
+      setActiveChat(null);
+      setMessages([]);
+    }
+
+    try {
+      const res = await fetch(`${API_URL}/friends/remove`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeader() },
+        body: JSON.stringify({ friendId: friend.id }),
+      });
+      if (!res.ok) throw new Error("remove failed");
+      // Server emits friendUpdate to both users; refresh local as well
+      loadFriends(token);
+      loadRequests(token);
+    } catch (e) {
+      // Re-fetch to restore accurate state on failure
+      loadFriends(token);
+      loadRequests(token);
+    }
+  };
 
   // ----------------------------
   // MESSAGING
@@ -332,45 +398,10 @@ export default function ChatPage() {
 
   const handleLogout = () => {
     removeToken();
-    localStorage.removeItem("chat_user");
+    try { removeUser(); } catch {}
     socket?.disconnect();
     navigate("/login", { replace: true });
   };
-
-  const handleRemoveFriend = async (friendId) => {
-    const token = getToken();
-    if (!token) return;
-
-    try {
-      const res = await fetch(`${API_URL}/friends/remove`, {
-        method: "POST",
-        headers: {
-          ...authHeader(),
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ friendId }),
-      });
-
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || `Failed to remove friend (${res.status})`);
-      }
-
-      // Refresh friends list after removal
-      loadFriends(token);
-
-      // Optional: clear active chat if the removed friend is currently selected
-      if (activeChat?.id === friendId) {
-        setActiveChat(null);
-        setMessages([]);
-      }
-
-    } catch (err) {
-      console.error("Remove friend error:", err);
-      alert("Failed to remove friend. Try again.");
-    }
-  };
-
 
   // ----------------------------
   // RENDER
@@ -473,23 +504,21 @@ export default function ChatPage() {
               {friends.map((f) => (
                 <li
                   key={f.id}
-                  onClick={() => selectFriend(f)}
-                  className={`flex items-center justify-between p-2 rounded cursor-pointer hover:bg-[#07171b] ${activeChat?.id === f.id ? "bg-[#07171b] border-l-4 border-[#00FF99]" : ""
-                    }`}
+                  className={`flex items-center justify-between p-2 rounded hover:bg-[#07171b] ${
+                    activeChat?.id === f.id ? "bg-[#07171b] border-l-4 border-[#00FF99]" : ""
+                  }`}
                 >
-                  <div>
+                  <div className="flex-1 cursor-pointer" onClick={() => selectFriend(f)}>
                     <div className="font-medium">{f.name}</div>
                     <div className="text-xs text-gray-400">{f.email}</div>
                   </div>
                   <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleRemoveFriend(f.id);
-                      }}
-                      className="text-xs px-2 py-1 bg-[#220000] rounded"
-                    >
-                      Remove
-                    </button>
+                    onClick={() => handleRemoveFriend(f)}
+                    className="ml-3 px-2 py-1 bg-red-600 text-white rounded text-xs"
+                    title="Remove friend"
+                  >
+                    Remove
+                  </button>
                 </li>
               ))}
             </ul>
