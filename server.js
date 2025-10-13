@@ -16,7 +16,7 @@ const port = process.env.PORT || 5000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({ origin: true }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'build')));
 
 // Postgres pool (supports DATABASE_URL or individual vars)
 let pool;
@@ -218,7 +218,7 @@ async function authMiddleware(req, res, next) {
 
 // Routes
 
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'build', 'index.html')));
 
 // SIGNUP - JSON or form
 app.post('/signup', async (req, res) => {
@@ -626,6 +626,12 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log(`socket disconnected ${socket.id}`);
   });
+});
+
+// SPA fallback: let React Router handle unknown paths on the client
+// Use a RegExp instead of '*' to be compatible with Express 5 / path-to-regexp v6
+app.get(/.*/, (req, res) => {
+  res.sendFile(path.join(__dirname, 'build', 'index.html'));
 });
 
 // Start server
