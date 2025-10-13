@@ -4,8 +4,19 @@ import { io } from "socket.io-client";
 import { useNavigate } from "react-router-dom";
 import { getToken, removeToken, authHeader, getUser, setUser, removeUser } from "../utils/auth";
 
-const API_URL = process.env.REACT_APP_API_URL || "http://localhost:5000";
-const SOCKET_URL = API_URL;
+// Determine API/Socket base URLs in a way that works for both dev and prod
+// - In dev (CRA at :3000) default to backend at :5000
+// - In prod default to same origin to avoid calling localhost
+let API_URL = (process.env.REACT_APP_API_URL || "").trim();
+if (!API_URL) {
+  const origin = window.location.origin;
+  if (/^(http:\/\/|https:\/\/)localhost:3000$/.test(origin) || /^(http:\/\/|https:\/\/)127\.0\.0\.1:3000$/.test(origin)) {
+    API_URL = "http://localhost:5000";
+  } else {
+    API_URL = origin;
+  }
+}
+let SOCKET_URL = (process.env.REACT_APP_SOCKET_URL || "").trim() || API_URL;
 
 export default function ChatPage() {
   const navigate = useNavigate();
