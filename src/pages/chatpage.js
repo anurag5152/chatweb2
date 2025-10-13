@@ -24,6 +24,9 @@ export default function ChatPage() {
   const [messages, setMessages] = useState([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [newMessage, setNewMessage] = useState("");
+  const [replyTo, setReplyTo] = useState(null);
+  const [openMenuFor, setOpenMenuFor] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
   const [sendingFriendEmail, setSendingFriendEmail] = useState(null);
 
   const messagesEndRef = useRef(null);
@@ -131,7 +134,16 @@ export default function ChatPage() {
         if (index !== -1) {
           // Replace optimistic with server-confirmed message
           const updated = [...prev];
-          updated[index] = normalized;
+          const optimistic = updated[index] || {};
+          const merged = { ...normalized };
+          // Preserve reply metadata if server did not include
+          if (!("reply_to_id" in merged) && !("replyToId" in merged) && !("reply_to" in merged)) {
+            if (optimistic.reply_to_id || optimistic.replyToId || optimistic.reply_to) {
+              merged.reply_to_id = optimistic.reply_to_id ?? optimistic.replyToId ?? optimistic.reply_to?.id;
+              merged.reply_to_content = optimistic.reply_to_content ?? optimistic.replyToContent ?? optimistic.reply_to?.content;
+            }
+          }
+          updated[index] = merged;
           return updated;
         } else {
           // Append normally
@@ -146,6 +158,14 @@ export default function ChatPage() {
 
   s.on("message", incomingHandler);
   s.on("receiveMessage", incomingHandler);
+  const onRemoteDelete = (payload) => {
+    const { messageId } = payload || {};
+    if (!messageId) return;
+    setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, content: "Message deleted", deleted: true } : m)));
+  };
+  s.on("messageDeleted", onRemoteDelete);
+  s.on("message_delete", onRemoteDelete);
+  s.on("messageRemoved", onRemoteDelete);
 
   // Friend updates
   s.on("friendUpdate", () => {
@@ -364,6 +384,10 @@ export default function ChatPage() {
     if (!newMessage.trim() || !activeChat?.conversation_id) return;
 
     const payload = { conversationId: activeChat.conversation_id, content: newMessage.trim() };
+    if (replyTo?.id) {
+      payload.replyToId = replyTo.id;
+      payload.replyToContent = replyTo.content;
+    }
 
     const optimistic = {
       id: `tmp-${Date.now()}`,
@@ -371,6 +395,9 @@ export default function ChatPage() {
       sender_id: currentUser.id,
       content: payload.content,
       timestamp: new Date().toISOString(),
+      ...(replyTo?.id
+        ? { reply_to_id: replyTo.id, reply_to_content: replyTo.content }
+        : {}),
     };
     setMessages((prev) => [...prev, optimistic]);
 
@@ -379,11 +406,56 @@ export default function ChatPage() {
       fetch(`${API_URL}/conversations/${payload.conversationId}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeader() },
-        body: JSON.stringify({ content: payload.content }),
+        body: JSON.stringify({ content: payload.content, replyToId: payload.replyToId }),
       }).then(() => selectFriend(activeChat));
     }
 
     setNewMessage("");
+    setReplyTo(null);
+  };
+
+  const handleReply = (msg) => {
+    setReplyTo(msg);
+    setOpenMenuFor(null);
+  };
+
+  const handleDeleteMessage = async (msg) => {
+    if (!activeChat?.conversation_id || !msg?.id) return;
+    setOpenMenuFor(null);
+    setDeletingId(msg.id);
+
+    // Optimistic mark as deleted
+    const original = { id: msg.id, content: msg.content, deleted: msg.deleted };
+    setMessages((prev) =>
+      prev.map((m) => (m.id === msg.id ? { ...m, content: "Message deleted", deleted: true } : m))
+    );
+
+    try {
+      if (socket?.connected) {
+        socket.emit("deleteMessage", { conversationId: activeChat.conversation_id, messageId: msg.id });
+      }
+      // Attempt primary endpoint
+      let res = await fetch(`${API_URL}/conversations/${activeChat.conversation_id}/messages/${msg.id}`, {
+        method: "DELETE",
+        headers: { ...authHeader(), Accept: "application/json" },
+      });
+      if (res.status === 404) {
+        // Try alternate: DELETE /messages/:id
+        res = await fetch(`${API_URL}/messages/${msg.id}`, {
+          method: "DELETE",
+          headers: { ...authHeader(), Accept: "application/json" },
+        });
+      }
+      // If still 404, keep optimistic delete and stop; do not revert and do not try noisy endpoints
+      if (!res.ok && res.status !== 404) {
+        throw new Error("delete failed");
+      }
+    } catch (e) {
+      // Revert on hard failure (non-404)
+      setMessages((prev) => prev.map((m) => (m.id === original.id ? { ...m, content: original.content, deleted: original.deleted } : m)));
+    } finally {
+      setDeletingId(null);
+    }
   };
 
   const formatTime = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -559,14 +631,82 @@ export default function ChatPage() {
                   {Object.entries(groupMessagesByDate(messages)).map(([date, msgs]) => (
                     <div key={date}>
                       <div className="text-center text-xs text-gray-400 my-4">{date}</div>
-                      {msgs.map((m) => (
-                        <div key={m.id || Math.random()} className={`flex mb-4 ${m.sender_id === currentUser.id ? "justify-end" : "justify-start"}`}>
-                          <div className={`p-3 rounded-xl max-w-md ${m.sender_id === currentUser.id ? "bg-[#1f8b5a] text-white" : "bg-[#0e1619] text-[#E6EDF3]"}`}>
-                            <div>{m.content}</div>
-                            <div className="text-xs text-gray-400 mt-1">{formatTime(m.timestamp)}</div>
+                      {msgs.map((m) => {
+                        const isMine = m.sender_id === currentUser.id;
+                        const showMenuLeft = isMine; // sent -> menu on left
+                        const showMenuRight = !isMine; // received -> menu on right
+                        const refId = m.reply_to_id || m.replyToId || m.reply_to?.id;
+                        let replyText = m.reply_to_content || m.replyToContent || m.reply_to?.content;
+                        if (!replyText && refId) {
+                          const ref = messages.find((x) => String(x.id) === String(refId));
+                          if (ref && ref.content) replyText = ref.content;
+                        }
+                        return (
+                          <div key={m.id || Math.random()} className={`flex mb-4 ${isMine ? "justify-end" : "justify-start"}`}>
+                            {showMenuLeft && (
+                              <div className="flex items-start mr-2 relative">
+                                <button
+                                  className="text-gray-400 hover:text-gray-200 px-2"
+                                  onClick={() => setOpenMenuFor(openMenuFor === m.id ? null : m.id)}
+                                  title="Options"
+                                >
+                                  ...
+                                </button>
+                                {openMenuFor === m.id && (
+                                  <div className="absolute top-6 left-0 bg-[#0e1619] border border-gray-700 rounded shadow-lg z-10">
+                                    <button className="block px-4 py-2 text-sm hover:bg-[#132026] w-full text-left" onClick={() => handleReply(m)}>
+                                      Reply
+                                    </button>
+                                    <button
+                                      disabled={deletingId === m.id}
+                                      className="block px-4 py-2 text-sm hover:bg-[#260f0f] w-full text-left text-red-400 disabled:opacity-50"
+                                      onClick={() => handleDeleteMessage(m)}
+                                    >
+                                      {deletingId === m.id ? "Deleting..." : "Delete"}
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            <div className={`p-3 rounded-xl max-w-md ${isMine ? "bg-[#1f8b5a] text-white" : "bg-[#0e1619] text-[#E6EDF3]"}`}>
+                              {replyText && (
+                                <div className="text-xs text-gray-300/80 border-l-2 border-gray-500 pl-2 mb-1 italic truncate max-w-[16rem]">
+                                  {replyText}
+                                </div>
+                              )}
+                              <div className={m.deleted ? "italic opacity-70" : ""}>{m.content}</div>
+                              <div className="text-xs text-gray-400 mt-1">{formatTime(m.timestamp)}</div>
+                            </div>
+
+                            {showMenuRight && (
+                              <div className="flex items-start ml-2 relative">
+                                <button
+                                  className="text-gray-400 hover:text-gray-200 px-2"
+                                  onClick={() => setOpenMenuFor(openMenuFor === m.id ? null : m.id)}
+                                  title="Options"
+                                >
+                                  ...
+                                </button>
+                                {openMenuFor === m.id && (
+                                  <div className="absolute top-6 right-0 bg-[#0e1619] border border-gray-700 rounded shadow-lg z-10">
+                                    <button className="block px-4 py-2 text-sm hover:bg-[#132026] w-full text-left" onClick={() => handleReply(m)}>
+                                      Reply
+                                    </button>
+                                    <button
+                                      disabled={deletingId === m.id}
+                                      className="block px-4 py-2 text-sm hover:bg-[#260f0f] w-full text-left text-red-400 disabled:opacity-50"
+                                      onClick={() => handleDeleteMessage(m)}
+                                    >
+                                      {deletingId === m.id ? "Deleting..." : "Delete"}
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            )}
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   ))}
                   <div ref={messagesEndRef} />
@@ -574,7 +714,17 @@ export default function ChatPage() {
               )}
             </main>
 
-            <footer className="p-4 border-t border-gray-800 flex gap-2 bg-[#041018]">
+            <footer className="p-4 border-t border-gray-800 flex flex-col gap-2 bg-[#041018]">
+              {replyTo && (
+                <div className="flex items-center justify-between text-xs bg-[#081820] border border-[#123] rounded px-2 py-1 text-gray-300">
+                  <div className="truncate">
+                    Replying to: <span className="italic">{replyTo.content}</span>
+                  </div>
+                  <button className="ml-2 text-gray-400 hover:text-gray-200" onClick={() => setReplyTo(null)} title="Cancel reply">
+                    ✕
+                  </button>
+                </div>
+              )}
               <input
                 value={newMessage}
                 onChange={(e) => setNewMessage(e.target.value)}
