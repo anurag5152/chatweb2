@@ -1,4 +1,3 @@
-// server.js - robust minimal chat backend with Socket.IO
 require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
@@ -12,13 +11,11 @@ const cors = require('cors');
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Basic middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({ origin: true }));
 app.use(express.static(path.join(__dirname, 'build')));
 
-// Postgres pool (supports DATABASE_URL or individual vars)
 let pool;
 if (process.env.DATABASE_URL) {
   pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -26,16 +23,14 @@ if (process.env.DATABASE_URL) {
   const dbUser = process.env.DB_USER;
   const dbHost = process.env.DB_HOST || 'localhost';
   const dbName = process.env.DB_NAME;
-  const dbPassword = process.env.DB_PASSWORD; // not logged
+  const dbPassword = process.env.DB_PASSWORD; 
   const dbPort = Number(process.env.DB_PORT || 5432);
 
-  // Fail fast if database is not configured
   if (!dbName || !dbUser) {
     console.error('[DB CONFIG] Missing DB_NAME or DB_USER. Please set env vars or DATABASE_URL.');
     process.exit(1);
   }
 
-  // Log sanitized DB config for verification (no secrets)
   console.log('[DB CONFIG]', { host: dbHost, port: dbPort, database: dbName, user: dbUser });
 
   pool = new Pool({
@@ -47,10 +42,8 @@ if (process.env.DATABASE_URL) {
   });
 }
 
-// Robust DB init: create tables if missing, add missing columns/constraints if table exists
 async function initDb() {
   try {
-    // users
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -61,7 +54,6 @@ async function initDb() {
       );
     `);
 
-    // friend_requests
     await pool.query(`
       CREATE TABLE IF NOT EXISTS friend_requests (
         id SERIAL PRIMARY KEY,
@@ -73,22 +65,20 @@ async function initDb() {
       );
     `);
 
-    // add FK constraints for friend_requests if missing (best-effort)
     try {
       await pool.query(`
         ALTER TABLE friend_requests
         ADD CONSTRAINT fr_req_fk_requester FOREIGN KEY (requester_id) REFERENCES users(id) ON DELETE CASCADE;
       `);
-    } catch (e) { /* ignore if exists */ }
+    } catch (e) {}
 
     try {
       await pool.query(`
         ALTER TABLE friend_requests
         ADD CONSTRAINT fr_req_fk_receiver FOREIGN KEY (receiver_id) REFERENCES users(id) ON DELETE CASCADE;
       `);
-    } catch (e) { /* ignore if exists */ }
+    } catch (e) {}
 
-    // conversations table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS conversations (
         id SERIAL PRIMARY KEY
@@ -96,7 +86,6 @@ async function initDb() {
       );
     `);
 
-    // helper to check column existence
     const colCheck = async (col) => {
       const r = await pool.query(
         `SELECT column_name FROM information_schema.columns WHERE table_name='conversations' AND column_name=$1`,
@@ -115,29 +104,25 @@ async function initDb() {
       await pool.query(`ALTER TABLE conversations ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now();`);
     }
 
-    // add FK constraints for conversations if missing
     try {
       await pool.query(`
         ALTER TABLE conversations
         ADD CONSTRAINT conv_fk_usera FOREIGN KEY (user_a) REFERENCES users(id) ON DELETE CASCADE;
       `);
-    } catch (e) { /* ignore if exists */ }
+    } catch (e) {}
 
     try {
       await pool.query(`
         ALTER TABLE conversations
         ADD CONSTRAINT conv_fk_userb FOREIGN KEY (user_b) REFERENCES users(id) ON DELETE CASCADE;
       `);
-    } catch (e) { /* ignore if exists */ }
+    } catch (e) {}
 
-    // create unique index on ordered pair to prevent duplicate 1:1 convs (LEAST/GREATEST)
-    // Make sure user_a and user_b exist before creating the index
     await pool.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS ux_conversations_user_pair
       ON conversations (LEAST(user_a, user_b), GREATEST(user_a, user_b));
     `);
 
-    // messages
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id BIGSERIAL PRIMARY KEY,
@@ -148,22 +133,20 @@ async function initDb() {
       );
     `);
 
-    // add FK constraints for messages if missing
     try {
       await pool.query(`
         ALTER TABLE messages
         ADD CONSTRAINT msg_fk_conv FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE;
       `);
-    } catch (e) { /* ignore if exists */ }
+    } catch (e) {}
 
     try {
       await pool.query(`
         ALTER TABLE messages
         ADD CONSTRAINT msg_fk_sender FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE;
       `);
-    } catch (e) { /* ignore if exists */ }
+    } catch (e) {}
 
-    // index for fast message retrieval
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at DESC);`);
 
     console.log('DB init complete');
@@ -173,7 +156,6 @@ async function initDb() {
   }
 }
 
-// run initDb robustly
 initDb()
   .then(() => console.log('DB ready'))
   .catch((e) => {
@@ -181,7 +163,6 @@ initDb()
     process.exit(1);
   });
 
-// JWT helpers
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_in_env';
 function signToken(user) {
   return jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
@@ -190,7 +171,6 @@ function verifyToken(token) {
   try { return jwt.verify(token, JWT_SECRET); } catch (e) { return null; }
 }
 
-// helper: detect if client expects JSON (AJAX/SPAs)
 function clientWantsJson(req) {
   const accept = (req.headers['accept'] || '').toLowerCase();
   const ct = (req.headers['content-type'] || '').toLowerCase();
@@ -200,7 +180,6 @@ function clientWantsJson(req) {
   return false;
 }
 
-// auth middleware for REST
 async function authMiddleware(req, res, next) {
   try {
     const header = req.headers['authorization'];
@@ -216,11 +195,8 @@ async function authMiddleware(req, res, next) {
   }
 }
 
-// Routes
-
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'build', 'index.html')));
 
-// SIGNUP - JSON or form
 app.post('/signup', async (req, res) => {
   const { name, email, password } = req.body;
   const wantsJson = clientWantsJson(req);
@@ -249,7 +225,6 @@ app.post('/signup', async (req, res) => {
   }
 });
 
-// LOGIN - JSON or form
 app.post('/login', async (req, res) => {
   const { email, password } = req.body;
   const wantsJson = clientWantsJson(req);
@@ -295,7 +270,6 @@ app.get('/me', authMiddleware, async (req, res) => {
   }
 });
 
-// Search users by q (email or name)
 app.get('/users/search', authMiddleware, async (req, res) => {
   const q = (req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q param required' });
@@ -313,7 +287,6 @@ app.get('/users/search', authMiddleware, async (req, res) => {
   }
 });
 
-// Send friend request by receiverEmail
 app.post('/friends/request', authMiddleware, async (req, res) => {
   const requesterId = req.user.id;
   const { receiverEmail } = req.body;
@@ -323,7 +296,6 @@ app.post('/friends/request', authMiddleware, async (req, res) => {
     if (r.rowCount === 0) return res.status(404).json({ error: 'User not found' });
     const receiverId = r.rows[0].id;
     if (receiverId === requesterId) return res.status(400).json({ error: 'Cannot friend yourself' });
-    // Upsert into friend_requests to avoid 409s and make operation idempotent
     await pool.query(
       `INSERT INTO friend_requests (requester_id, receiver_id, status)
        VALUES ($1,$2,'pending')
@@ -331,8 +303,6 @@ app.post('/friends/request', authMiddleware, async (req, res) => {
        DO UPDATE SET status='pending'`,
       [requesterId, receiverId]
     );
-
-    // Notify both parties
     try {
       io.to(`user:${receiverId}`).emit('friendUpdate');
       io.to(`user:${requesterId}`).emit('friendUpdate');
@@ -344,9 +314,7 @@ app.post('/friends/request', authMiddleware, async (req, res) => {
   }
 });
 
-// Respond to friend request (accept / reject). Body: { requestId, action }
 app.post('/friends/respond', authMiddleware, async (req, res) => {
-  // coerce & validate inputs immediately
   const userId = Number(req.user.id);
   const requestId = Number(req.body?.requestId);
   const action = (req.body?.action || '').toString();
@@ -362,7 +330,6 @@ app.post('/friends/respond', authMiddleware, async (req, res) => {
 
   const client = await pool.connect();
   try {
-    // make sure to pass integers into the query params
     const rq = await client.query('SELECT * FROM friend_requests WHERE id=$1 AND receiver_id=$2', [requestId, userId]);
     if (rq.rowCount === 0) {
       return res.status(404).json({ error: 'friend request not found' });
@@ -370,7 +337,6 @@ app.post('/friends/respond', authMiddleware, async (req, res) => {
 
     const requesterId = Number(rq.rows[0].requester_id);
     if (!Number.isFinite(requesterId)) {
-      // defensive: unexpected DB state
       return res.status(500).json({ error: 'invalid requester id in DB' });
     }
 
@@ -379,11 +345,9 @@ app.post('/friends/respond', authMiddleware, async (req, res) => {
       return res.json({ ok: true, status: 'rejected' });
     }
 
-    // accept: mark accepted and create conversation if not exists
     await client.query('BEGIN');
     await client.query('UPDATE friend_requests SET status=$1 WHERE id=$2', ['accepted', requestId]);
 
-    // find existing conversation (ordered pair) — ensure params are integers
     const convCheck = await client.query(
       `SELECT id FROM conversations
        WHERE LEAST(user_a, user_b) = LEAST($1::int,$2::int) AND GREATEST(user_a, user_b) = GREATEST($1::int,$2::int) LIMIT 1`,
@@ -400,7 +364,6 @@ app.post('/friends/respond', authMiddleware, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // success — respond with conversation id if created/found
     try {
       io.to(`user:${requesterId}`).emit('friendUpdate');
       io.to(`user:${userId}`).emit('friendUpdate');
@@ -415,7 +378,6 @@ app.post('/friends/respond', authMiddleware, async (req, res) => {
   }
 });
 
-// List incoming friend requests
 app.get('/friends/requests', authMiddleware, async (req, res) => {
   const uid = req.user.id;
   try {
@@ -433,7 +395,6 @@ app.get('/friends/requests', authMiddleware, async (req, res) => {
   }
 });
 
-// POST /friends/remove
 app.post("/friends/remove", authMiddleware, async (req, res) => {
   const { friendId } = req.body;
   const userId = Number(req.user.id);
@@ -442,13 +403,11 @@ app.post("/friends/remove", authMiddleware, async (req, res) => {
   if (!Number.isFinite(otherId)) return res.status(400).json({ error: "Missing friendId" });
 
   try {
-    // Delete any pending friend_requests in either direction
     await pool.query(
       `DELETE FROM friend_requests WHERE (requester_id=$1 AND receiver_id=$2) OR (requester_id=$2 AND receiver_id=$1)`,
       [userId, otherId]
     );
 
-    // Find the conversation between the two users
     const convoRes = await pool.query(
       `SELECT id FROM conversations 
        WHERE LEAST(user_a, user_b) = LEAST($1::int,$2::int) AND GREATEST(user_a, user_b) = GREATEST($1::int,$2::int)
@@ -458,16 +417,14 @@ app.post("/friends/remove", authMiddleware, async (req, res) => {
 
     if (convoRes.rowCount > 0) {
       const convoId = convoRes.rows[0].id;
-      // Defensive: delete messages explicitly, then conversation
       try { await pool.query(`DELETE FROM messages WHERE conversation_id = $1`, [convoId]); } catch (e) { /* ignore */ }
       await pool.query(`DELETE FROM conversations WHERE id = $1`, [convoId]);
     }
 
-    // Notify both users via Socket.IO
     try {
       io.to(`user:${userId}`).emit('friendUpdate');
       io.to(`user:${otherId}`).emit('friendUpdate');
-    } catch (e) { /* ignore */ }
+    } catch (e) {}
 
     res.json({ success: true });
   } catch (err) {
@@ -477,8 +434,6 @@ app.post("/friends/remove", authMiddleware, async (req, res) => {
 });
 
 
-
-// List user's 1:1 conversations and other participant info
 app.get('/conversations', authMiddleware, async (req, res) => {
   const uid = req.user.id;
   try {
@@ -500,7 +455,6 @@ app.get('/conversations', authMiddleware, async (req, res) => {
   }
 });
 
-// Fetch messages for a conversation (newest first)
 app.get('/conversations/:id/messages', authMiddleware, async (req, res) => {
   const convId = Number(req.params.id);
   const uid = req.user.id;
@@ -524,7 +478,6 @@ app.get('/conversations/:id/messages', authMiddleware, async (req, res) => {
   }
 });
 
-// Optional REST message post (socket is primary)
 app.post('/conversations/:id/messages', authMiddleware, async (req, res) => {
   const convId = Number(req.params.id);
   const uid = req.user.id;
@@ -538,7 +491,6 @@ app.post('/conversations/:id/messages', authMiddleware, async (req, res) => {
     const inserted = await pool.query('INSERT INTO messages (conversation_id, sender_id, content) VALUES ($1,$2,$3) RETURNING id, created_at', [convId, uid, content]);
     const message = { id: inserted.rows[0].id, conversation_id: convId, sender_id: uid, content, created_at: inserted.rows[0].created_at };
 
-    // broadcast to socket room
     io.to(`conversation:${convId}`).emit('message', message);
 
     return res.json({ message });
@@ -548,15 +500,12 @@ app.post('/conversations/:id/messages', authMiddleware, async (req, res) => {
   }
 });
 
-// HTTP server + Socket.IO
 const server = http.createServer(app);
 
-// socket.io with permissive CORS for local dev
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
 });
 
-// Socket auth via JWT in handshake.auth.token or Authorization header
 io.use((socket, next) => {
   try {
     const token = socket.handshake.auth?.token || (socket.handshake.headers?.authorization ? socket.handshake.headers.authorization.split(' ')[1] : null);
@@ -574,10 +523,8 @@ io.use((socket, next) => {
 io.on('connection', (socket) => {
   const uid = socket.userId;
   console.log(`socket connected ${socket.id} user ${uid}`);
-  // Join a stable per-user room for targeted events
-  try { socket.join(`user:${uid}`); } catch (e) { /* noop */ }
+  try { socket.join(`user:${uid}`); } catch (e) {}
 
-  // join conversation room
   socket.on('join', async ({ conversationId }) => {
     if (!conversationId) return;
     try {
@@ -594,7 +541,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // sendMessage
   socket.on('sendMessage', async ({ conversationId, content }) => {
     if (!conversationId || typeof content !== 'string' || content.trim() === '') {
       return socket.emit('error', 'invalid payload');
@@ -628,22 +574,17 @@ io.on('connection', (socket) => {
   });
 });
 
-// SPA fallback: let React Router handle unknown paths on the client
-// Use a RegExp instead of '*' to be compatible with Express 5 / path-to-regexp v6
 app.get(/.*/, (req, res) => {
   res.sendFile(path.join(__dirname, 'build', 'index.html'));
 });
 
-// Start server
 server.listen(port, () => {
   console.log(`Server listening http://localhost:${port}`);
 });
 
-// catch unhandled rejections / exceptions for easier debugging in dev
 process.on('unhandledRejection', (reason, p) => {
   console.error('Unhandled Rejection at Promise', p, 'reason:', reason && reason.stack ? reason.stack : reason);
 });
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception thrown', err && err.stack ? err.stack : err);
-  // in production you might want to exit process; for dev we keep running for convenience
 });

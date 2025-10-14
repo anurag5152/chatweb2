@@ -1,12 +1,8 @@
-// src/pages/ChatPage.jsx
 import React, { useState, useEffect, useRef } from "react";
 import { io } from "socket.io-client";
 import { useNavigate } from "react-router-dom";
 import { getToken, removeToken, authHeader, getUser, setUser, removeUser } from "../utils/auth";
 
-// Determine API/Socket base URLs in a way that works for both dev and prod
-// - In dev (CRA at :3000) default to backend at :5000
-// - In prod default to same origin to avoid calling localhost
 let API_URL = (process.env.REACT_APP_API_URL || "").trim();
 if (!API_URL) {
   const origin = window.location.origin;
@@ -21,9 +17,6 @@ let SOCKET_URL = (process.env.REACT_APP_SOCKET_URL || "").trim() || API_URL;
 export default function ChatPage() {
   const navigate = useNavigate();
 
-  // ----------------------------
-  // STATE
-  // ----------------------------
   const [currentUser, setCurrentUser] = useState(null);
   const [socket, setSocket] = useState(null);
   const [socketConnected, setSocketConnected] = useState(false);
@@ -40,18 +33,13 @@ export default function ChatPage() {
 
   const messagesEndRef = useRef(null);
 
-  // Ref to avoid stale closures in socket handlers
   const activeChatRef = useRef(activeChat);
   useEffect(() => {
     activeChatRef.current = activeChat;
   }, [activeChat]);
 
-  // Track joined conversation rooms
   const joinedConvosRef = useRef(new Set());
 
-  // ----------------------------
-  // SCROLL HELPER
-  // ----------------------------
   const scrollToBottom = () => {
     if (messagesEndRef.current) {
       messagesEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -71,7 +59,6 @@ export default function ChatPage() {
         ...m,
         timestamp: m.timestamp || m.created_at || new Date().toISOString(),
       }));
-      // Ensure ascending chronological order by timestamp
       normalized.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
       setMessages(normalized);
     } catch {
@@ -79,9 +66,6 @@ export default function ChatPage() {
     }
   };
 
-  // ----------------------------
-  // AUTH & INITIAL LOAD
-  // ----------------------------
   useEffect(() => {
     const token = getToken();
     if (!token) return navigate("/login", { replace: true });
@@ -112,16 +96,11 @@ export default function ChatPage() {
         socket.disconnect();
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ----------------------------
-  // SOCKET CONNECTION
-  // ----------------------------
   const connectSocket = (user, token) => {
     if (!token) return;
 
-    // Disconnect existing socket if any
     if (socket) {
       socket.off();
       socket.disconnect();
@@ -138,51 +117,42 @@ export default function ChatPage() {
       console.log("Socket connected:", s.id);
       setSocketConnected(true);
 
-      // Rejoin all previously joined rooms on reconnect
       joinedConvosRef.current.forEach((cid) => s.emit("join", { conversationId: cid }));
     });
 
     s.on("disconnect", () => setSocketConnected(false));
     s.on("connect_error", (err) => console.warn("Socket connect error:", err?.message || err));
 
-    // Incoming message handler
     const incomingHandler = (msg) => {
       const normalized = {
         ...msg,
         timestamp: msg.timestamp || msg.created_at || new Date().toISOString(),
       };
-      // Ignore deleted messages entirely
       if (normalized.deleted === true || normalized.content === "Message deleted") return;
 
       const convoId = normalized.conversation_id ?? normalized.conversationId ?? normalized.conversation;
 
       if (activeChatRef.current && convoId === activeChatRef.current.conversation_id) {
         setMessages((prev) => {
-          // Check if there's an optimistic message with same content
           const index = prev.findIndex(
             (m) => m.id?.startsWith("tmp-") && m.content === normalized.content
           );
 
           if (index !== -1) {
-            // Replace optimistic with server-confirmed message
             const updated = [...prev];
             updated[index] = { ...normalized };
             return updated;
           } else {
-            // Append normally
             return [...prev, normalized];
           }
         });
       } else {
-        // Handle messages for other chats here (like unread counts)
-        // incrementUnread(convoId);
       }
     };
 
     s.on("message", incomingHandler);
     s.on("receiveMessage", incomingHandler);
 
-    // Friend updates
     s.on("friendUpdate", () => {
       const t = getToken();
       if (t) {
@@ -194,9 +164,6 @@ export default function ChatPage() {
     setSocket(s);
   };
 
-  // ----------------------------
-  // API LOADERS
-  // ----------------------------
   const loadFriends = (token) => {
     fetch(`${API_URL}/conversations`, { headers: { ...authHeader(), Accept: "application/json" } })
       .then((r) => (r.ok ? r.json() : []))
@@ -225,9 +192,6 @@ export default function ChatPage() {
       .catch(() => setFriendRequests([]));
   };
 
-  // ----------------------------
-  // SEARCH USERS
-  // ----------------------------
   useEffect(() => {
     const query = searchQuery.trim();
     if (query.length < 3) {
@@ -252,11 +216,9 @@ export default function ChatPage() {
 
           let filtered = users.filter((u) => u && u.email);
 
-          // Exclude current user safely
           const me = currentUser?.email?.toLowerCase();
           if (me) filtered = filtered.filter((u) => u.email.toLowerCase() !== me);
 
-          // If a full email is typed, only show exact match
           if (isEmailLike && isFullEmail) {
             const ql = query.toLowerCase();
             filtered = filtered.filter((u) => u.email.toLowerCase() === ql);
@@ -265,7 +227,6 @@ export default function ChatPage() {
           setSearchResults(filtered);
         })
         .catch(() => {
-          // Treat errors (including 404s) as no results; avoid noisy console
           setSearchResults([]);
         });
     }, 300);
@@ -276,14 +237,10 @@ export default function ChatPage() {
     };
   }, [searchQuery, currentUser]);
 
-  // ----------------------------
-  // FRIEND REQUESTS
-  // ----------------------------
   const handleSendFriendRequest = (email) => {
     const token = getToken();
     if (!token) return navigate("/login", { replace: true });
 
-    // Optimistic mark as requested
     const lower = email.toLowerCase();
     setSearchResults((prev) => prev.map((u) => (u.email.toLowerCase() === lower ? { ...u, requested: true } : u)));
     setSendingFriendEmail(lower);
@@ -294,7 +251,6 @@ export default function ChatPage() {
       body: JSON.stringify({ receiverEmail: email }),
     })
       .then(async (res) => {
-        // Treat 409 (already exists) as success to keep UI consistent
         if (res.status === 409) return { ok: true, already: true };
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
@@ -307,7 +263,6 @@ export default function ChatPage() {
         loadFriends(token);
       })
       .catch(() => {
-        // Revert optimistic change on hard error (not 409)
         setSearchResults((prev) => prev.map((u) => (u.email.toLowerCase() === lower ? { ...u, requested: false } : u)));
       })
       .finally(() => setSendingFriendEmail(null));
@@ -333,12 +288,10 @@ export default function ChatPage() {
   const handleAcceptFriendRequest = (id) => respondToFriendRequest(id, "accept");
   const handleRejectFriendRequest = (id) => respondToFriendRequest(id, "reject");
 
-  // Remove friend (also deletes conversation + messages server-side)
   const handleRemoveFriend = async (friend) => {
     const token = getToken();
     if (!token || !friend?.id) return;
 
-    // Optimistic: remove from list and clear active chat if matches
     setFriends((prev) => prev.filter((f) => f.id !== friend.id));
     if (activeChat?.id === friend.id) {
       setActiveChat(null);
@@ -352,19 +305,14 @@ export default function ChatPage() {
         body: JSON.stringify({ friendId: friend.id }),
       });
       if (!res.ok) throw new Error("remove failed");
-      // Server emits friendUpdate to both users; refresh local as well
       loadFriends(token);
       loadRequests(token);
     } catch (e) {
-      // Re-fetch to restore accurate state on failure
       loadFriends(token);
       loadRequests(token);
     }
   };
 
-  // ----------------------------
-  // MESSAGING
-  // ----------------------------
   const selectFriend = async (friend) => {
     setActiveChat(friend);
     setMessages([]);
@@ -379,7 +327,6 @@ export default function ChatPage() {
       setLoadingMessages(false);
     }
 
-    // Join conversation room
     if (socket && friend.conversation_id) {
       socket.emit("join", { conversationId: friend.conversation_id });
       joinedConvosRef.current.add(friend.conversation_id);
@@ -397,7 +344,6 @@ export default function ChatPage() {
       sender_id: currentUser.id,
       content: payload.content,
       timestamp: new Date().toISOString(),
-      // no reply metadata
     };
     setMessages((prev) => [...prev, optimistic]);
 
@@ -429,9 +375,6 @@ export default function ChatPage() {
     navigate("/login", { replace: true });
   };
 
-  // ----------------------------
-  // RENDER
-  // ----------------------------
   if (!currentUser)
     return (
       <div className="flex items-center justify-center h-screen text-gray-400 bg-[#0D1117]">
@@ -448,7 +391,7 @@ export default function ChatPage() {
         .themed-scroll::-webkit-scrollbar-thumb { background: #123; border-radius: 8px; border: 2px solid #06131a; }
         .themed-scroll::-webkit-scrollbar-thumb:hover { background: #1f2c3a; }
       `}</style>
-      {/* LEFT SIDEBAR - desktop */}
+      
       <aside className="hidden md:flex w-1/4 flex-col bg-[#071017] border-r border-gray-800 themed-scroll">
         <div className="p-4 border-b border-gray-800">
           <div className="text-lg font-semibold">{currentUser.name}</div>
@@ -463,7 +406,6 @@ export default function ChatPage() {
           </div>
         </div>
 
-        {/* Search Results */}
         {searchResults.length > 0 && (
           <div className="p-3 border-b border-gray-800">
             <div className="text-sm text-[#00FF99] mb-2 font-semibold">Search Results</div>
@@ -502,7 +444,6 @@ export default function ChatPage() {
           </div>
         )}
 
-        {/* Friend Requests */}
         <div className="p-3 border-b border-gray-800">
           <div className="text-sm text-[#00FF99] mb-2 font-semibold">Friend Requests</div>
           {friendRequests.length > 0 ? (
@@ -529,7 +470,6 @@ export default function ChatPage() {
           )}
         </div>
 
-        {/* Friends List */}
         <div className="p-3 flex-1 overflow-y-auto themed-scroll">
           <div className="text-sm text-[#00FF99] font-semibold mb-2">Friends</div>
           {friends.length > 0 ? (
@@ -561,7 +501,6 @@ export default function ChatPage() {
         </div>
       </aside>
 
-      {/* Mobile Sidebar Drawer */}
       {showSidebar && (
         <div className="md:hidden fixed inset-0 z-40">
           <div className="absolute inset-0 bg-black/60" onClick={() => setShowSidebar(false)} />
@@ -675,7 +614,6 @@ export default function ChatPage() {
         </div>
       )}
 
-      {/* RIGHT CHAT PANEL */}
       <div className="flex-1 flex flex-col">
         <header className="p-4 border-b border-gray-800 flex items-center justify-between bg-[#041018]">
           <div className="flex items-center gap-3">
@@ -747,15 +685,3 @@ export default function ChatPage() {
     </div>
   );
 }
-
-/*
-==============================
-SOCKET ISSUE EXPLANATION
-==============================
-1. Messages were not appearing live because the socket handler closed over a stale `activeChat` state.
-2. On refresh, state was fresh so messages appeared.
-3. FIX:
-   - Use `activeChatRef` inside socket.on to always access the latest chat.
-   - Track joined rooms in `joinedConvosRef` to rejoin on reconnect.
-   - Optimistic UI ensures sending messages is immediate.
-*/
